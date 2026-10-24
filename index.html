@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DET · Fala</title>
+<style>
+:root { --bg:#f2f4f7; --surface:#fff; --ink:#14213d; --muted:#566176; --line:#d8dde6; --accent:#2b4c9b; --accent-ink:#fff; --mark:#c92d45; --ok:#17704f; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1624; --surface:#172033; --ink:#e8edf6; --muted:#9aa6bb; --line:#2a3652; --accent:#8fb0ff; --accent-ink:#0f1624; --mark:#ff7f92; --ok:#5fd3a3; color-scheme: dark; } }
+* { box-sizing: border-box; }
+[hidden] { display:none !important; }
+body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; padding:24px 16px 64px; }
+.wrap { max-width:680px; margin:0 auto; display:grid; gap:18px; }
+.eyebrow { font:500 12px ui-monospace,Menlo,monospace; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.card { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:18px; display:grid; gap:14px; }
+.q { margin:0; white-space:pre-wrap; }
+.photo { display:block; width:100%; height:auto; border-radius:8px; border:1px solid var(--line); }
+.clock { font:700 56px ui-monospace,Menlo,monospace; font-variant-numeric:tabular-nums; }
+.clock.prep { color:var(--muted); }
+.clock.rec { color:var(--mark); }
+.meter { height:10px; background:var(--bg); border-radius:5px; overflow:hidden; border:1px solid var(--line); }
+.meter i { display:block; height:100%; width:0; background:var(--ok); transition:width .08s; }
+button { font:600 17px system-ui,sans-serif; border-radius:10px; padding:12px 20px; border:1px solid var(--accent); background:var(--accent); color:var(--accent-ink); cursor:pointer; }
+button.ghost { background:transparent; color:var(--accent); }
+button:disabled { opacity:.5; cursor:default; }
+.row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.msg { margin:0; font-weight:600; }
+.msg.ok { color:var(--ok); }
+.msg.bad { color:var(--mark); }
+.hint { margin:0; color:var(--muted); font-size:15px; }
+audio { width:100%; }
+</style></head>
+<body><div class="wrap">
+  <div class="eyebrow" id="kind">DET · Speaking</div>
+  <div class="card">
+    <p class="q" id="q"></p>
+    <img class="photo" id="photo" alt="Foto da questão" hidden>
+    <div class="clock" id="clock">0:00</div>
+    <div class="meter" aria-hidden="true"><i id="lvl"></i></div>
+    <p class="hint" id="hint"></p>
+    <div class="row" id="btns"></div>
+    <p class="msg" id="msg" aria-live="polite"></p>
+    <audio id="play" controls hidden></audio>
+  </div>
+</div>
+<script>
+// Standalone recorder (top-level page: Apps Script frames refuse the microphone). Everything comes from the link:
+// ?t=key&s=<Apps Script /exec URL>&k=<day-item>&q=<question>&kind=..&p=prep&m=max&n=min#img=<base64url svg>
+var P = new URLSearchParams(location.search);
+var C = { t: P.get('t') || '', s: P.get('s') || '', k: P.get('k') || 'avulso', q: P.get('q') || '', kind: P.get('kind') || 'Speaking',
+  prep: +(P.get('p') || 20), max: +(P.get('m') || 90), min: +(P.get('n') || 30) };
+var $ = function (id) { return document.getElementById(id); };
+var stream = null, rec = null, chunks = [], timer = null, endsAt = 0, started = 0, phase = 'idle', anal = null, raf = 0;
+$('q').textContent = C.q || 'Responda falando.';
+$('kind').textContent = 'DET · ' + C.kind;
+// The question's photo travels in the link's #img= part as base64url (too long for the query string).
+(function () {
+  var hs = location.hash, i = hs.indexOf('img=');
+  if (i >= 0) { $('photo').src = 'data:image/svg+xml;base64,' + hs.slice(i + 4).split('&')[0].replace(/-/g, '+').replace(/_/g, '/'); $('photo').hidden = false; }
+})();
+function mmss(n) { n = Math.max(0, Math.ceil(n)); return Math.floor(n / 60) + ':' + String(n % 60).padStart(2, '0'); }
+function btns(list) {
+  var b = $('btns'); b.innerHTML = '';
+  list.forEach(function (x) { var e = document.createElement('button'); e.type = 'button'; e.textContent = x[0]; if (x[2]) e.className = x[2]; if (x[3]) e.id = x[3]; e.onclick = x[1]; b.appendChild(e); });
+}
+function msg(t, cls) { $('msg').textContent = t || ''; $('msg').className = 'msg ' + (cls || ''); }
+function idle() {
+  phase = 'idle'; $('clock').className = 'clock'; $('clock').textContent = mmss(C.max); msg('');
+  $('hint').textContent = (C.prep ? C.prep + ' s para se preparar, depois ' : '') + 'até ' + C.max + ' s de fala' + (C.min ? ' (mínimo de ' + C.min + ' s)' : '') + '. A gravação começa sozinha quando o preparo acaba.';
+  btns([['Começar', start]]);
+}
+async function start() {
+  msg('');
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+  catch (e) { msg('O microfone foi bloqueado (' + (e && e.name) + '). Permita o microfone para este site no navegador e toque em Começar de novo.', 'bad'); return; }
+  try {
+    var actx = new (window.AudioContext || window.webkitAudioContext)();
+    anal = actx.createAnalyser(); anal.fftSize = 512; actx.createMediaStreamSource(stream).connect(anal); meter();
+  } catch (e) { anal = null; }
+  if (!C.prep) return speak();
+  phase = 'prep'; endsAt = Date.now() + C.prep * 1000; $('clock').className = 'clock prep';
+  $('hint').textContent = 'Prepare-se: pense no que vai dizer.';
+  btns([['Começar a falar agora', speak]]); tick();
+}
+function meter() {
+  if (!anal) return;
+  var a = new Uint8Array(anal.fftSize); anal.getByteTimeDomainData(a);
+  var m = 0; for (var i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - 128));
+  $('lvl').style.width = Math.min(100, m / 64 * 100) + '%'; raf = requestAnimationFrame(meter);
+}
+function speak() {
+  if (phase === 'rec') return;
+  phase = 'rec'; started = Date.now(); endsAt = started + C.max * 1000; chunks = [];
+  var opts = { audioBitsPerSecond: 48000 };
+  ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].some(function (t) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) { opts.mimeType = t; return true; }
+  });
+  rec = new MediaRecorder(stream, opts);
+  rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+  rec.onstop = upload;
+  rec.start(1000);
+  $('clock').className = 'clock rec'; $('hint').textContent = 'Gravando. Fale sem parar até o tempo acabar.';
+  btns([['Terminar', stop, '', 'end']]); $('end').disabled = C.min > 0; tick();
+}
+function tick() {
+  clearInterval(timer);
+  timer = setInterval(function () {
+    var left = (endsAt - Date.now()) / 1000; $('clock').textContent = mmss(left);
+    if (phase === 'rec' && $('end')) $('end').disabled = (Date.now() - started) / 1000 < C.min;
+    if (left <= 0) { if (phase === 'prep') speak(); else if (phase === 'rec') stop(); }
+  }, 200);
+}
+function stop() {
+  if (phase !== 'rec') return;
+  phase = 'saving'; clearInterval(timer);
+  C.secs = Math.round((Date.now() - started) / 1000);
+  stream.getTracks().forEach(function (t) { t.stop(); });
+  cancelAnimationFrame(raf); $('lvl').style.width = '0';
+  btns([]); $('hint').textContent = ''; msg('Salvando o áudio…');
+  try { rec.stop(); } catch (e) { upload(); }
+}
+function upload() {
+  var blob = new Blob(chunks, { type: (rec && rec.mimeType) || 'audio/webm' });
+  $('play').src = URL.createObjectURL(blob); $('play').hidden = false;
+  var r = new FileReader();
+  r.onload = function () {
+    var b64 = String(r.result).split(',')[1];
+    var fail = function (why) { msg('✗ Não consegui salvar (' + why + '). Toque em Tentar de novo.', 'bad'); btns([['Tentar de novo', upload]]); };
+    // text/plain keeps this a simple request (no CORS preflight); Apps Script answers through a redirect with CORS open.
+    fetch(C.s, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ t: C.t, meta: { k: C.k, q: C.q, secs: C.secs, mime: blob.type }, b64: b64 }) })
+      .then(function (r) { return r.json(); })
+      .then(function (o) {
+        if (o && o.ok) { msg('✓ Áudio recebido (' + C.secs + ' s). Pode fechar esta aba e voltar ao DET.', 'ok'); btns([['Gravar de novo', idle, 'ghost']]); }
+        else fail((o && o.error) || 'resposta inesperada');
+      }, function (e) { fail((e && e.message) || 'sem conexão'); });
+  };
+  r.readAsDataURL(blob);
+}
+if (!C.t || !/^https:\/\/script\.google\.com\//.test(C.s)) { msg('Link incompleto. Abra o gravador pelo botão Responder falando da página do DET.', 'bad'); }
+else idle();
+</script>
+</body></html>
