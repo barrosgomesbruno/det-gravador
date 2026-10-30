@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DET · Fala</title>
+<style>
+:root { --bg:#f2f4f7; --surface:#fff; --ink:#14213d; --muted:#566176; --line:#d8dde6; --accent:#2b4c9b; --accent-ink:#fff; --mark:#c92d45; --ok:#17704f; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1624; --surface:#172033; --ink:#e8edf6; --muted:#9aa6bb; --line:#2a3652; --accent:#8fb0ff; --accent-ink:#0f1624; --mark:#ff7f92; --ok:#5fd3a3; color-scheme: dark; } }
+* { box-sizing: border-box; }
+[hidden] { display:none !important; }
+body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; padding:24px 16px 64px; }
+.wrap { max-width:680px; margin:0 auto; display:grid; gap:18px; }
+.eyebrow { font:500 12px ui-monospace,Menlo,monospace; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.card { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:18px; display:grid; gap:14px; }
+.q { margin:0; white-space:pre-wrap; }
+.photo { display:block; width:100%; height:auto; border-radius:8px; border:1px solid var(--line); }
+.clock { font:700 56px ui-monospace,Menlo,monospace; font-variant-numeric:tabular-nums; }
+.clock.prep { color:var(--muted); }
+.clock.rec { color:var(--mark); }
+.meter { height:10px; background:var(--bg); border-radius:5px; overflow:hidden; border:1px solid var(--line); }
+.meter i { display:block; height:100%; width:0; background:var(--ok); transition:width .08s; }
+button { font:600 17px system-ui,sans-serif; border-radius:10px; padding:12px 20px; border:1px solid var(--accent); background:var(--accent); color:var(--accent-ink); cursor:pointer; }
+button.ghost { background:transparent; color:var(--accent); }
+button:disabled { opacity:.5; cursor:default; }
+.row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.msg { margin:0; font-weight:600; }
+.msg.ok { color:var(--ok); }
+.msg.bad { color:var(--mark); }
+.hint { margin:0; color:var(--muted); font-size:15px; }
+.said { margin:0; padding:12px; border-radius:8px; background:var(--bg); white-space:pre-wrap; }
+audio { width:100%; }
+</style></head>
+<body><div class="wrap">
+  <div class="eyebrow" id="kind">DET · Speaking</div>
+  <div class="card">
+    <p class="q" id="q"></p>
+    <img class="photo" id="photo" alt="Foto da questão" hidden>
+    <div class="clock" id="clock">0:00</div>
+    <div class="meter" aria-hidden="true"><i id="lvl"></i></div>
+    <p class="hint" id="hint"></p>
+    <div class="row" id="btns"></div>
+    <p class="msg" id="msg" aria-live="polite"></p>
+    <p class="hint" id="asrNote"></p>
+    <p class="said" id="said" hidden></p>
+    <audio id="play" controls hidden></audio>
+  </div>
+</div>
+<script>
+// Standalone recorder (top-level page: artifact and Apps Script frames refuse the microphone). Everything comes from the link:
+// ?t=key&s=<Apps Script /exec URL>&k=<day-item>&q=<question>&kind=..&p=prep&m=max&n=min#img=<base64url svg>
+// After recording it (1) saves the audio to the user's Drive through Apps Script, (2) transcribes it in the browser with
+// Whisper (transformers.js; the model downloads once and stays cached), and (3) hands audio + transcript + fluency numbers
+// back to the DET page that opened it, which corrects the answer inside the question. Then this tab closes itself.
+var P = new URLSearchParams(location.search);
+var C = { t: P.get('t') || '', s: P.get('s') || '', k: P.get('k') || 'avulso', q: P.get('q') || '', kind: P.get('kind') || 'Speaking',
+  prep: +(P.get('p') || 20), max: +(P.get('m') || 90), min: +(P.get('n') || 30) };
+var TJS = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.min.js', MODEL = 'Xenova/whisper-base.en';
+var $ = function (id) { return document.getElementById(id); };
+var stream = null, rec = null, chunks = [], timer = null, endsAt = 0, started = 0, phase = 'idle', anal = null, raf = 0;
+var asr = null, asrLoad = null, det = null, result = null, saved = null;
+$('q').textContent = C.q || 'Responda falando.';
+$('kind').textContent = 'DET · ' + C.kind + ' · v3';
+// The question's photo travels in the link's #img= part as base64url (too long for the query string).
+(function () {
+  var hs = location.hash, i = hs.indexOf('img=');
+  if (i >= 0) { $('photo').src = 'data:image/svg+xml;base64,' + hs.slice(i + 4).split('&')[0].replace(/-/g, '+').replace(/_/g, '/'); $('photo').hidden = false; }
+})();
+// The DET page keeps saying hello to this tab; remember who it is so the result goes back to exactly that page.
+window.addEventListener('message', function (e) {
+  var m = e.data || {};
+  if (m.type === 'det-hello' && m.k === C.k) { det = { win: e.source, origin: e.origin }; if (result) sendBack(); }
+  if (m.type === 'det-ok' && m.k === C.k && det && e.origin === det.origin) done();
+});
+function mmss(n) { n = Math.max(0, Math.ceil(n)); return Math.floor(n / 60) + ':' + String(n % 60).padStart(2, '0'); }
+function btns(list) {
+  var b = $('btns'); b.innerHTML = '';
+  list.forEach(function (x) { var e = document.createElement('button'); e.type = 'button'; e.textContent = x[0]; if (x[2]) e.className = x[2]; if (x[3]) e.id = x[3]; e.onclick = x[1]; b.appendChild(e); });
+}
+function msg(t, cls) { $('msg').textContent = t || ''; $('msg').className = 'msg ' + (cls || ''); }
+function note(t) { $('asrNote').textContent = t || ''; }
+
+/* ---------- speech recognition (in this browser) ---------- */
+function loadAsr() {
+  if (asrLoad) return asrLoad;
+  var files = {};
+  asrLoad = import(TJS).then(function (T) {
+    return T.pipeline('automatic-speech-recognition', MODEL, { dtype: 'q8', device: 'wasm', progress_callback: function (p) {
+      if (p.status === 'progress' && p.total) {
+        files[p.file] = [p.loaded, p.total];
+        var a = 0, b = 0; Object.keys(files).forEach(function (f) { a += files[f][0]; b += files[f][1]; });
+        if (b > 5e6) note('Preparando a correção automática: ' + Math.floor(a / b * 100) + '% (só na primeira vez).');
+      }
+    } });
+  }).then(function (p) { asr = p; note(phase === 'fixing' ? 'Transcrevendo sua fala…' : ''); return p; }, function (e) { asrLoad = null; throw e; });
+  return asrLoad;
+}
+// Decode the recording and resample it to 16 kHz mono, the input Whisper expects.
+async function pcm16k(blob) {
+  var buf = await blob.arrayBuffer(), AC = window.AudioContext || window.webkitAudioContext, ac = new AC();
+  var dec = await new Promise(function (res, rej) { var p = ac.decodeAudioData(buf, res, rej); if (p && p.then) p.then(res, rej); });
+  try { ac.close(); } catch (e) {}
+  var len = Math.max(1, Math.ceil(dec.duration * 16000)), OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  var off = new OAC(1, len, 16000), src = off.createBufferSource();
+  src.buffer = dec; src.connect(off.destination); src.start();
+  var out = await off.startRendering();
+  return out.getChannelData(0);
+}
+// Silent stretches of 0.7 s or more between the first and the last spoken moment (30 ms frames, level relative to the room noise).
+function pausesOf(x) {
+  var F = 480, n = Math.floor(x.length / F), rms = new Float32Array(n);
+  for (var i = 0; i < n; i++) { var s = 0; for (var j = i * F; j < (i + 1) * F; j++) s += x[j] * x[j]; rms[i] = Math.sqrt(s / F); }
+  var sorted = Array.prototype.slice.call(rms).sort(function (a, b) { return a - b; });
+  var floor = sorted[Math.floor(n * 0.1)] || 0, peak = sorted[Math.floor(n * 0.95)] || 0, thr = Math.max(floor * 2.5, floor + (peak - floor) * 0.05, 0.004);
+  var first = -1, last = -1;
+  for (i = 0; i < n; i++) if (rms[i] > thr) { if (first < 0) first = i; last = i; }
+  var out = [], run = 0;
+  for (i = first; first >= 0 && i <= last; i++) {
+    if (rms[i] > thr) { if (run * 0.03 >= 0.7) out.push(Math.round(run * 3) / 100); run = 0; } else run++;
+  }
+  return { list: out, speakSecs: first >= 0 ? Math.round((last - first + 1) * 3) / 100 : 0 };
+}
+// Whisper reads at most 30 s at a time; cut long answers at their quietest moment between 20 and 28 s, so no word is split.
+function pieces(x) {
+  var R = 16000, out = [], s = 0;
+  while (x.length - s > 28 * R) {
+    var best = s + 25 * R, low = Infinity;
+    for (var c = s + 20 * R; c < s + 28 * R; c += 1600) {
+      var e = 0; for (var j = c; j < c + 4800; j++) e += x[j] * x[j];
+      if (e < low) { low = e; best = c + 2400; }
+    }
+    out.push(x.subarray(s, best)); s = best;
+  }
+  out.push(x.subarray(s));
+  return out;
+}
+async function transcribe(blob) {
+  var x = await pcm16k(blob);
+  var p = asr || await loadAsr(), parts = pieces(x), texts = [];
+  for (var i = 0; i < parts.length; i++) {
+    if (parts.length > 1) note('Transcrevendo sua fala… parte ' + (i + 1) + ' de ' + parts.length);
+    var o = await p(parts[i]);
+    texts.push(String((o && o.text) || '').trim());
+  }
+  var text = texts.join(' ').replace(/\s+/g, ' ').trim();
+  var words = text ? text.split(' ').filter(function (w) { return /[A-Za-z0-9]/.test(w); }).length : 0, pz = pausesOf(x);
+  return { text: text, words: words, wpm: C.secs ? Math.round(words * 60 / C.secs) : 0, pauses: pz.list.length,
+    longest: pz.list.length ? Math.max.apply(null, pz.list) : 0,
+    fillers: (text.match(/\b(uh+|um+|uhm|erm|hmm)\b/gi) || []).length };
+}
+
+/* ---------- recording ---------- */
+function idle() {
+  phase = 'idle'; result = null; saved = null; $('clock').className = 'clock'; $('clock').textContent = mmss(C.max); msg(''); $('said').hidden = true;
+  $('hint').textContent = (C.prep ? C.prep + ' s para se preparar, depois ' : '') + 'até ' + C.max + ' s de fala' + (C.min ? ' (mínimo de ' + C.min + ' s)' : '') + '. A gravação começa sozinha quando o preparo acaba.';
+  btns([['Começar', start]]);
+}
+async function start() {
+  msg('');
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+  catch (e) { msg('O microfone foi bloqueado (' + (e && e.name) + '). Permita o microfone para este site no navegador e toque em Começar de novo.', 'bad'); return; }
+  try {
+    var actx = new (window.AudioContext || window.webkitAudioContext)();
+    anal = actx.createAnalyser(); anal.fftSize = 512; actx.createMediaStreamSource(stream).connect(anal); meter();
+  } catch (e) { anal = null; }
+  if (!C.prep) return speak();
+  phase = 'prep'; endsAt = Date.now() + C.prep * 1000; $('clock').className = 'clock prep';
+  $('hint').textContent = 'Prepare-se: pense no que vai dizer.';
+  btns([['Começar a falar agora', speak]]); tick();
+}
+function meter() {
+  if (!anal) return;
+  var a = new Uint8Array(anal.fftSize); anal.getByteTimeDomainData(a);
+  var m = 0; for (var i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - 128));
+  $('lvl').style.width = Math.min(100, m / 64 * 100) + '%'; raf = requestAnimationFrame(meter);
+}
+function speak() {
+  if (phase === 'rec') return;
+  phase = 'rec'; started = Date.now(); endsAt = started + C.max * 1000; chunks = [];
+  var opts = { audioBitsPerSecond: 48000 };
+  ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].some(function (t) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) { opts.mimeType = t; return true; }
+  });
+  rec = new MediaRecorder(stream, opts);
+  rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+  rec.onstop = finish;
+  rec.start(1000);
+  $('clock').className = 'clock rec'; $('hint').textContent = 'Gravando. Fale sem parar até o tempo acabar.';
+  btns([['Terminar', stop, '', 'end']]); $('end').disabled = C.min > 0; tick();
+}
+function tick() {
+  clearInterval(timer);
+  timer = setInterval(function () {
+    var left = (endsAt - Date.now()) / 1000; $('clock').textContent = mmss(left);
+    if (phase === 'rec' && $('end')) $('end').disabled = (Date.now() - started) / 1000 < C.min;
+    if (left <= 0) { if (phase === 'prep') speak(); else if (phase === 'rec') stop(); }
+  }, 200);
+}
+function stop() {
+  if (phase !== 'rec') return;
+  phase = 'fixing'; clearInterval(timer);
+  C.secs = Math.round((Date.now() - started) / 1000);
+  stream.getTracks().forEach(function (t) { t.stop(); });
+  cancelAnimationFrame(raf); $('lvl').style.width = '0';
+  btns([]); $('hint').textContent = ''; msg('Áudio gravado (' + C.secs + ' s). Preparando a correção…');
+  try { rec.stop(); } catch (e) { finish(); }
+}
+async function finish() {
+  var blob = new Blob(chunks, { type: (rec && rec.mimeType) || 'audio/webm' });
+  $('play').src = URL.createObjectURL(blob); $('play').hidden = false;
+  var drive = saveDrive(blob);
+  var t = null;
+  try {
+    note(asr ? 'Transcrevendo sua fala…' : 'Baixando o reconhecedor de fala (só na primeira vez) e transcrevendo…');
+    t = await transcribe(blob);
+    note('');
+  } catch (e) { note('Não consegui transcrever aqui (' + ((e && e.message) || 'erro') + '). O áudio vai para o DET e o tutor transcreve.'); }
+  if (t) { $('said').textContent = 'O que entendi: ' + (t.text || '(nada)'); $('said').hidden = false; }
+  result = Object.assign({ type: 'det-fala', v: 1, k: C.k, secs: C.secs, mime: blob.type, audio: blob, at: new Date().toISOString() }, t || { text: null });
+  var txt = t && t.words ? saveText(t) : Promise.resolve();
+  await drive; await txt;
+  if (t && !t.words) { phase = 'empty'; msg('✗ Não ouvi nenhuma palavra. Confira o microfone e toque em Gravar de novo.', 'bad'); btns([['Gravar de novo', idle]]); return; }
+  deliver();
+}
+// Keep offering the answer until the DET page confirms (a phone may pause the DET tab while it is in the background).
+function deliver() {
+  var n = 0, iv = setInterval(function () {
+    n++; if (phase !== 'fixing' && phase !== 'lost') { clearInterval(iv); return; }
+    sendBack();
+    if (n === 4 && phase === 'fixing') lost();
+    if (n > 60) clearInterval(iv);
+  }, 2000);
+  sendBack();
+}
+// Copy of the audio in the Drive folder "DET fala" (the tutor's backup). The DET page does not wait for it.
+function saveDrive(blob) {
+  return new Promise(function (resolve) {
+    var r = new FileReader();
+    r.onload = function () {
+      fetch(C.s, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ t: C.t, meta: { k: C.k, q: C.q, secs: C.secs, mime: blob.type }, b64: String(r.result).split(',')[1] }) })
+        .then(function (x) { return x.json(); })
+        .then(function (o) { saved = !!(o && o.ok); resolve(); }, function () { saved = false; resolve(); });
+    };
+    r.onerror = function () { saved = false; resolve(); };
+    r.readAsDataURL(blob);
+  });
+}
+// Mailbox for the DET page: the transcript and fluency numbers go to the same Drive folder as a small text file named
+// <day-item>-txt_<stamp>.webm (content = JSON). The DET page cannot talk to this tab (browsers cut the link between
+// claude.ai and a popup), so it fetches that file through the Apps Script list/get API and corrects the answer by itself.
+function saveText(t) {
+  return new Promise(function (resolve) {
+    try {
+      var body = JSON.stringify({ text: t.text, words: t.words, secs: C.secs, wpm: t.wpm, pauses: t.pauses, longest: t.longest, fillers: t.fillers, at: result.at });
+      var b64 = btoa(unescape(encodeURIComponent(body)));
+      fetch(C.s, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ t: C.t, meta: { k: C.k + '-txt', q: '', secs: C.secs, mime: 'text/plain' }, b64: b64 }) })
+        .then(function (x) { return x.json(); }).then(function () { resolve(); }, function () { resolve(); });
+    } catch (e) { resolve(); }
+  });
+}
+function sendBack() {
+  if (!result || !det) return;
+  try { det.win.postMessage(result, det.origin); } catch (e) {}
+}
+function done() {
+  if (phase !== 'fixing' && phase !== 'lost') return;
+  phase = 'sent';
+  msg('✓ Resposta enviada para a questão do DET. A correção aparece lá. Voltando…', 'ok');
+  btns([['Gravar de novo', idle, 'ghost']]);
+  setTimeout(function () { try { window.close(); } catch (e) {} }, 1500);
+}
+function lost() {
+  phase = 'lost';
+  if (!det) msg(saved ? '✓ Fala salva. Volte para a página do DET: a correção aparece sozinha em instantes (ou toque em Ver correção da minha fala).'
+    : '✗ Não consegui entregar a resposta ao DET nem salvar no Drive. Toque em Tentar de novo.', saved ? 'ok' : 'bad');
+  else msg('A página do DET ainda não confirmou. Toque em Voltar ao DET: a correção deve aparecer na questão. Se não aparecer, me avise na conversa.', 'ok');
+  btns(saved || det ? [['Voltar ao DET', function () { try { window.close(); } catch (e) {} }], ['Gravar de novo', idle, 'ghost']]
+    : [['Tentar de novo', function () { phase = 'fixing'; msg('Tentando de novo…'); saveDrive(result.audio).then(deliver); }]]);
+}
+if (!C.t || !/^https:\/\/script\.google\.com\//.test(C.s)) { msg('Link incompleto. Abra o gravador pelo botão Responder falando da página do DET.', 'bad'); }
+else { idle(); loadAsr().catch(function () { note(''); }); }
+</script>
+</body></html>
